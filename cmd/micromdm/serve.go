@@ -35,12 +35,14 @@ import (
 	"github.com/micromdm/micromdm/platform/user"
 	userbuiltin "github.com/micromdm/micromdm/platform/user/builtin"
 	"github.com/micromdm/micromdm/server"
+	"github.com/micromdm/micromdm/webhook"
 
 	"github.com/boltdb/bolt"
 	"github.com/go-kit/kit/auth/basic"
 	"github.com/go-kit/kit/log"
 	httptransport "github.com/go-kit/kit/transport/http"
 	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
 	"github.com/groob/finalizer/logutil"
 	"github.com/micromdm/go4/env"
 	"github.com/micromdm/go4/httputil"
@@ -101,6 +103,7 @@ body {
 `
 
 func serve(args []string) error {
+	ctx := context.Background()
 	flagset := flag.NewFlagSet("serve", flag.ExitOnError)
 	var (
 		flConfigPath             = flagset.String("config-path", env.String("MICROMDM_CONFIG_PATH", "/var/db/micromdm"), "Path to configuration directory")
@@ -168,12 +171,23 @@ func serve(args []string) error {
 	if err := os.MkdirAll(*flConfigPath, 0755); err != nil {
 		return errors.Wrapf(err, "creating config directory %s", *flConfigPath)
 	}
+
+	webhookURL := *flCommandWebhookURL
+	var results *webhook.ResultStore
+	if webhookURL == "" {
+		u, store, err := webhook.Start(ctx) // ctx is your server's root context
+		if err != nil {
+			stdlog.Fatalf("internal webhook: %v", err)
+		}
+		webhookURL, results = u, store
+	}
+
 	sm := &server.Server{
 		ConfigPath:             *flConfigPath,
 		ServerPublicURL:        strings.TrimRight(*flServerURL, "/"),
 		Depsim:                 *flDepSim,
 		TLSCertPath:            *flTLSCert,
-		CommandWebhookURL:      *flCommandWebhookURL,
+		CommandWebhookURL:      webhookURL,
 		NoCmdHistory:           *flNoCmdHistory,
 		UseDynSCEPChallenge:    *flUseDynChallenge,
 		GenDynSCEPChallenge:    *flGenDynChalEnroll,
@@ -242,7 +256,7 @@ func serve(args []string) error {
 	)
 	go blueprintWorker.Run(context.Background())
 
-	ctx := context.Background()
+	
 	httpLogger := log.With(logger, "transport", "http")
 
 	appDB := &appsbuiltin.Repo{Path: *flRepoPath}
@@ -328,6 +342,7 @@ func serve(args []string) error {
 		}
 
 		r.HandleFunc("/boltbackup", httputil2.RequireBasicAuth(boltBackup(sm.DB), "micromdm", *flAPIKey, "micromdm"))
+		r.Methods("GET").Path("/v1/response/{uuid}").Handler(httputil2.RequireBasicAuth(responseHandler(results), "micromdm", *flAPIKey, "micromdm"))
 	} else {
 		mainLogger.Log("msg", "no api key specified")
 	}
@@ -418,6 +433,31 @@ func boltBackup(db *bolt.DB) http.HandlerFunc {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
+	}
+}
+
+// responseHandler looks up a command response by UUID in the webhook result
+// store and returns the stored JSON object. Returns 404 when the store is
+// unavailable or no entry exists for the UUID.
+func responseHandler(store *webhook.ResultStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uuid := mux.Vars(r)["uuid"]
+		if store == nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"not found"}`))
+			return
+		}
+		body, ok := store.Get(uuid)
+		if !ok {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"not found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
 	}
 }
 
